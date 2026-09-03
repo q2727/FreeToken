@@ -252,6 +252,17 @@ def parse_args(
             "at config time if the checkpoint ships no dSpark weights."
         ),
     )
+    parser.add_argument(
+        "--dspark-block-size",
+        type=int,
+        default=0,
+        help=(
+            "Override the checkpoint's dSpark block width (gamma). 0 keeps the "
+            "checkpoint value. The confidence/markov heads are shared across "
+            "positions so the drafter runs at any width, but widths beyond the "
+            "trained one can lower acceptance."
+        ),
+    )
 
     parser.add_argument(
         "--dspark-fallback-acceptance",

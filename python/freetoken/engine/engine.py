@@ -1428,6 +1428,9 @@ class Engine:
             accepted_counts.append(n_acc)
             off += span
 
+        from freetoken.metrics.expert_overlap import finish_verify_round
+        finish_verify_round(batch, accepted_counts)
+
         # Select the target's saved compressor state after anchor + accepted prefix.
         # Later rejected rows may share its 128-token page and overwrite the live ring.
         self._restore_speculative_carry(batch, selected_rows)
@@ -1617,6 +1620,8 @@ class Engine:
                     logits = self.model.forward()
                     get_features = getattr(self.model, "dspark_target_features", None)
                     target_features = get_features() if get_features is not None else None
+                from freetoken.metrics.expert_overlap import begin_verify_round
+                begin_verify_round(batch)
         if profiling:
             torch.cuda.synchronize(self.device)
             assert prof is not None
@@ -1808,6 +1813,11 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
 
         model_config.dsv4_args.dspark_enabled = True
         set_dspark_enabled(True)  # so the weight reader builds the same model
+        if getattr(config, "dspark_block_size", 0):
+            model_config.dsv4_args.dspark_block_size = int(config.dspark_block_size)
+            logger.info_rank0(
+                f"dSpark block size overridden to {config.dspark_block_size}"
+            )
         # parse_config already ran, before the flag existed, so its extra_moe_layers is
         # still 0. The expert banks would then build n_layers + n_draft entries while
         # the offload cache was sized for n_layers, and the two assert against each

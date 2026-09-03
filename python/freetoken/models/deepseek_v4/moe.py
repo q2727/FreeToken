@@ -179,6 +179,10 @@ class MoE(nn.Module):
         shape = x.size()
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x, input_ids.flatten())
+        # Expert-overlap metrics (FT_EXPERT_METRICS_DIR): record the router's
+        # full-space top-k per MoE layer for the active verify round.
+        from freetoken.metrics.expert_overlap import note_router
+        note_router(self.experts.layer_id, indices)
         # Shared expert enqueued before routed_forward: hybrid decode blocks on the
         # CPU pool inside routed_forward, so this GEMM must already be on the stream
         # to overlap the CPU overflow compute.

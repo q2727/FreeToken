@@ -86,6 +86,11 @@ class EngineConfig:
     # DeepSeek-V4 only: build the checkpoint's dSpark drafter for block speculative
     # decoding. Reaches the model through dsv4_args.dspark_enabled (_adjust_dsv4_config).
     speculative_dspark: bool = False
+    # Runtime override for the checkpoint's dspark_block_size (gamma). 0 keeps the
+    # checkpoint value. The confidence/markov heads are shared across positions, so
+    # the drafter runs at any width, but a width beyond the trained one can lower
+    # acceptance (the drafter leaves its training distribution).
+    dspark_block_size: int = 0
     # Experimental, request-local DSpark circuit breaker. 0 disables it. Once at least
     # dspark_fallback_min_drafted proposals have been measured below this acceptance
     # rate, use ordinary target decode for dspark_fallback_steps steps, then probe the
