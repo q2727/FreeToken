@@ -1319,6 +1319,15 @@ class Engine:
             self._record_adaptive_draft_cost(batch)
             draft_cost_recorded = True
 
+        # Metric-1 shadow rerun (FT_EXPERT_METRICS_DIR): re-run this verify with
+        # MoE restricted to cache-resident experts and record the shadow router
+        # sets. Must run BEFORE the accept loop below: release_tail frees the
+        # rejected positions' pages and the requests are truncated, either of
+        # which would invalidate the slot maps the rerun's attention reads. The
+        # rerun snapshots and restores every pool row it touches.
+        from freetoken.metrics.shadow_rerun import maybe_run_shadow
+        maybe_run_shadow(self, batch, target_cpu, proposed_cpu)
+
         emitted: list[torch.Tensor] = []
         release_tail = getattr(batch, "release_tail", None)
         selected_rows: list[int] = []

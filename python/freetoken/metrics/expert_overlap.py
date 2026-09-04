@@ -25,6 +25,11 @@ _DIR = os.environ.get("FT_EXPERT_METRICS_DIR", "")
 _ACTIVE = bool(_DIR)
 _STATE: dict = {"round": -1, "layers": {}, "batch": None}
 
+# Metric-1 shadow rerun: while _SHADOW["active"] is set, note_router diverts into
+# _SHADOW["layers"] (the rerun's full-space router sets A') and the original round
+# capture in _STATE stays untouched for finish_verify_round.
+_SHADOW: dict = {"active": False, "layers": {}}
+
 
 def active() -> bool:
     return _ACTIVE
@@ -36,11 +41,53 @@ def reset_round_capture() -> None:
 
 def note_router(layer_id: int, indices: torch.Tensor) -> None:
     """Called from DSV4 MoE.forward with the router's topk ids [rows, topk]."""
-    if not _ACTIVE or _STATE["batch"] is None:
+    if not _ACTIVE:
+        return
+    if _SHADOW["active"]:
+        if layer_id not in _SHADOW["layers"]:
+            _SHADOW["layers"][layer_id] = indices.detach().to("cpu", non_blocking=False)
+        return
+    if _STATE["batch"] is None:
         return
     if layer_id in _STATE["layers"]:
         return
     _STATE["layers"][layer_id] = indices.detach().to("cpu", non_blocking=False)
+
+
+def shadow_active() -> bool:
+    return _ACTIVE and _SHADOW["active"]
+
+
+def begin_shadow() -> None:
+    _SHADOW["active"] = True
+    _SHADOW["layers"] = {}
+
+
+def end_shadow() -> None:
+    _SHADOW["active"] = False
+
+
+def current_round() -> int:
+    """Id of the last finished round; the in-flight round is current_round() + 1."""
+    return _STATE["round"]
+
+
+def resident_mask(cache, layer_id: int, num_experts: int, top_k: int):
+    """Bool [num_experts] mask of the experts currently resident in ``layer_id``'s
+    GPU slot cache, or None when the layer cannot honor a cache-only restriction
+    (no offload cache, or fewer resident experts than top_k).
+
+    ``id_of_slot`` holds ``layer_id * num_experts + expert_id`` per slot (-1 = free)."""
+    if cache is None or getattr(cache, "id_of_slot", None) is None:
+        return None
+    ids = cache.id_of_slot
+    lo = layer_id * num_experts
+    own = ids[(ids >= lo) & (ids < lo + num_experts)] - lo
+    if own.numel() < top_k:
+        return None
+    mask = torch.zeros(num_experts, dtype=torch.bool, device=ids.device)
+    mask[own.long()] = True
+    return mask
 
 
 def begin_verify_round(batch) -> None:
@@ -160,6 +207,92 @@ def summary(rows) -> str:
     n_pairs = 0
     for r in rows:
         for p in r.get("metric2_pairs", []):
+            n_pairs += 1
+            for lid, ov in p["overlap"].items():
+                a = acc[lid]
+                a[0] += ov["inter"] / 6.0  # topk=6
+                a[1] += ov["jaccard"]
+                a[2] += 1
+    lines = [f"pairs={n_pairs}"]
+    for lid in sorted(acc, key=lambda x: int(x)):
+        a = acc[lid]
+        if a[2]:
+            lines.append(
+                f"layer {lid}: mean_inter_top6={a[0]/a[2]:.3f} mean_jaccard={a[1]/a[2]:.4f} n={a[2]}"
+            )
+    return "\n".join(lines)
+
+
+def write_shadow_record(round_id: int, accepted_counts) -> int:
+    """Write the metric-1 shadow-rerun record for the in-flight round.
+
+    Pairs, per rejected slot (``slot j >= n_acc``, same window-offset row convention
+    as finish_verify_round: row = base + j), the original round's full-space router
+    set A (from the live _STATE capture, consumed later by finish_verify_round)
+    against the shadow rerun's full-space set A' (_SHADOW["layers"], recorded while
+    the MoE compute itself was restricted to cache-resident experts). Emits
+    shadow.jsonl next to rounds.jsonl; returns the number of rejected slots."""
+    if not _ACTIVE or _STATE["batch"] is None:
+        return 0
+    geo = _STATE["batch"]
+    layers = _STATE["layers"]
+    shadow = _SHADOW["layers"]
+    k = geo["k"]
+    reqs = []
+    pairs = []
+    n_rejected = 0
+    for i in range(geo["n_reqs"]):
+        n_acc = int(accepted_counts[i])
+        base = i * geo["span"]
+        slots = []
+        for j in range(n_acc, k):
+            n_rejected += 1
+            row = base + j
+            tok = (
+                int(geo["draft_tokens"][i * k + j])
+                if geo["draft_tokens"] is not None
+                else None
+            )
+            sets = {}
+            per_layer = {}
+            for lid, idx in shadow.items():
+                if row < idx.shape[0]:
+                    sets[str(lid)] = idx[row].tolist()
+            for lid, idx in layers.items():
+                if lid in shadow and row < idx.shape[0] and row < shadow[lid].shape[0]:
+                    per_layer[str(lid)] = _overlap(idx[row].tolist(), shadow[lid][row].tolist())
+            slots.append({"slot": j, "token_id": tok, "sets": sets})
+            pairs.append(
+                {
+                    "req": geo["req_uids"][i],
+                    "slot": j,
+                    "token_id": tok,
+                    "overlap": per_layer,
+                }
+            )
+        reqs.append({"req": geo["req_uids"][i], "n_acc": n_acc, "rejected": slots})
+    rec = {
+        "round": round_id,
+        "ts": time.time(),
+        "k": k,
+        "reqs": reqs,
+        "metric1_pairs": pairs,
+    }
+    out = Path(_DIR)
+    out.mkdir(parents=True, exist_ok=True)
+    with open(out / "shadow.jsonl", "a") as f:
+        f.write(json.dumps(rec) + "\n")
+    return n_rejected
+
+
+def summary_shadow(rows) -> str:
+    """Aggregate metric1_pairs from shadow.jsonl rows into per-layer means."""
+    import collections
+
+    acc = collections.defaultdict(lambda: [0.0, 0.0, 0])
+    n_pairs = 0
+    for r in rows:
+        for p in r.get("metric1_pairs", []):
             n_pairs += 1
             for lid, ov in p["overlap"].items():
                 a = acc[lid]

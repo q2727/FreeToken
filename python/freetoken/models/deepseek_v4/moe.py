@@ -37,7 +37,7 @@ class Gate(nn.Module):
         else:
             self.bias = nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32), requires_grad=False)
 
-    def forward(self, x: torch.Tensor, input_ids: torch.Tensor):
+    def forward(self, x: torch.Tensor, input_ids: torch.Tensor, restrict: torch.Tensor | None = None):
         scores = bf16_linear_fp32(x, self.weight)
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1)
@@ -48,9 +48,15 @@ class Gate(nn.Module):
         original_scores = scores
         if self.bias is not None:
             scores = scores + self.bias
-        if self.hash:
+        if self.hash and restrict is None:
             indices = self.tid2eid[input_ids]
         else:
+            if restrict is not None:
+                # Metric-1 shadow rerun: choose top-k only among ``restrict``'s
+                # True entries (the layer's cache-resident experts). Hash layers
+                # fall back to score-based selection here -- the tid2eid table
+                # cannot express a resident-set restriction.
+                scores = scores.masked_fill(~restrict, float("-inf"))
             indices = scores.topk(self.topk, dim=-1)[1]
         weights = original_scores.gather(1, indices)
         if self.score_func != "softmax":
@@ -178,11 +184,27 @@ class MoE(nn.Module):
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)
-        weights, indices = self.gate(x, input_ids.flatten())
+        input_ids = input_ids.flatten()
+        weights, indices = self.gate(x, input_ids)
         # Expert-overlap metrics (FT_EXPERT_METRICS_DIR): record the router's
-        # full-space top-k per MoE layer for the active verify round.
-        from freetoken.metrics.expert_overlap import note_router
+        # full-space top-k per MoE layer for the active verify round. During a
+        # metric-1 shadow rerun this is A' -- the unrestricted choice under the
+        # shadow hidden states -- diverted into the shadow capture.
+        from freetoken.metrics.expert_overlap import note_router, resident_mask, shadow_active
         note_router(self.experts.layer_id, indices)
+        if shadow_active():
+            # Metric-1 cache-only rerun: recompute the routing restricted to the
+            # layer's GPU-cache-resident experts for the actual MoE compute
+            # (ensure_experts then hits on every route, so the rerun never
+            # fetches and the resident set is stable through the shadow pass).
+            mask = resident_mask(
+                self.experts.offload_cache,
+                self.experts.layer_id,
+                self.experts.num_experts,
+                self.experts.top_k,
+            )
+            if mask is not None:
+                weights, indices = self.gate(x, input_ids, restrict=mask)
         # Shared expert enqueued before routed_forward: hybrid decode blocks on the
         # CPU pool inside routed_forward, so this GEMM must already be on the stream
         # to overlap the CPU overflow compute.
