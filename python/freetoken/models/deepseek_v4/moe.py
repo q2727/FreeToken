@@ -245,6 +245,13 @@ class MoE(nn.Module):
                     count = min(self.experts.top_k, int(mask.sum().item()))
                     fw, fi = self.gate(x[failed], input_ids[failed],
                                         restrict=mask, topk=count)
+                    # routed_forward's executor buffer is fixed at model top-k;
+                    # pad partial-cache routes with zero-weight resident IDs.
+                    if count < self.experts.top_k:
+                        pad = self.experts.top_k - count
+                        fill = fi[:, :1].expand(-1, pad)
+                        fi = torch.cat((fi, fill), dim=1)
+                        fw = torch.cat((fw, torch.zeros_like(fw[:, :pad])), dim=1)
                     routed[failed] = self.experts.routed_forward(
                         x[failed], fw.float().contiguous(),
                         fi.to(torch.int32).contiguous())
