@@ -23,6 +23,7 @@ import torch
 
 _DIR = os.environ.get("FT_EXPERT_METRICS_DIR", "")
 _ACTIVE = bool(_DIR)
+_TOP4 = os.environ.get("FT_TOP4_METRICS", "0") == "1"
 _STATE: dict = {"round": -1, "layers": {}, "batch": None}
 
 # Metric-1 shadow rerun: while _SHADOW["active"] is set, note_router diverts into
@@ -36,21 +37,48 @@ def shadow_layer_capture():
 def write_top4_record(round_id: int, accepted_counts, top4_tokens, captures) -> None:
     if not _ACTIVE or _STATE["batch"] is None:
         return
-    geo, real, k = _STATE["batch"], _STATE["layers"], _STATE["batch"]["k"]
+    geo, k = _STATE["batch"], _STATE["batch"]["k"]
+    top4_tokens = top4_tokens.reshape(geo["n_reqs"], k, 4)
+    assert len(captures) == 4
     reqs = []
     for i, n_acc in enumerate(accepted_counts):
         items = []
         for j in range(n_acc, k):
-            row = i * geo["span"] + j
+            row = i * geo["span"] + j + 1
             candidates = []
             for rank, layers in enumerate(captures):
-                sets = {str(lid): idx[row].tolist() for lid, idx in layers.items() if row < idx.shape[0]}
-                candidates.append({"rank": rank, "token_id": int(top4_tokens[i * k + j, rank]), "sets": sets})
-            items.append({"slot": j, "candidates": candidates})
-        reqs.append({"req": geo["req_uids"][i], "n_acc": int(n_acc), "rejected": items})
+                sets = {str(lid): idx[row].tolist() for lid, idx in layers.items()}
+                candidates.append({"rank": rank, "token_id": int(top4_tokens[i, j, rank]), "sets": sets})
+            items.append({"slot": j, "position": int(geo["positions"][row]), "candidates": candidates})
+        reqs.append({"req": geo["req_uids"][i], "n_acc": int(n_acc),
+                     "top4_tokens": top4_tokens[i].tolist(), "rejected": items})
     out = Path(_DIR); out.mkdir(parents=True, exist_ok=True)
     with open(out / "top4_shadow.jsonl", "a") as f:
-        f.write(json.dumps({"round": round_id, "k": k, "reqs": reqs}) + "\n")
+        f.write(json.dumps({"schema": 2, "round": round_id, "k": k,
+                           "context": "rank_cohort", "reqs": reqs}) + "\n")
+
+
+def top4_enabled() -> bool:
+    return _TOP4 and _ACTIVE
+
+
+def begin_decode_observation(batch):
+    if top4_enabled() and not batch.speculative and batch.is_decode:
+        _STATE["layers"] = {}
+        _STATE["observing"] = True
+
+
+def finish_decode_observation(batch):
+    if not _STATE.get("observing"):
+        return
+    _STATE["observing"] = False
+    records = []
+    for i, req in enumerate(batch.reqs):
+        records.append({"req": req.uid, "position": int(batch.positions.reshape(-1)[i]),
+            "token_id": int(batch.input_ids.reshape(-1)[i]),
+            "sets": {str(lid): idx[i].tolist() for lid, idx in _STATE["layers"].items()}})
+    with open(Path(_DIR) / "actual_decode.jsonl", "a") as stream:
+        stream.write(json.dumps({"schema": 2, "after_round": _STATE["round"], "tokens": records}) + "\n")
 
 
 def active() -> bool:
@@ -69,7 +97,7 @@ def note_router(layer_id: int, indices: torch.Tensor) -> None:
         if layer_id not in _SHADOW["layers"]:
             _SHADOW["layers"][layer_id] = indices.detach().to("cpu", non_blocking=False)
         return
-    if _STATE["batch"] is None:
+    if _STATE["batch"] is None and not _STATE.get("observing"):
         return
     if layer_id in _STATE["layers"]:
         return
@@ -128,6 +156,9 @@ def begin_verify_round(batch) -> None:
         if batch.draft_tokens is not None
         else None,
         "req_uids": [r.uid for r in batch.reqs],
+        "positions": batch.positions.detach().cpu().reshape(-1).clone() if _TOP4 else None,
+        "input_ids": batch.input_ids.detach().cpu().reshape(-1).clone() if _TOP4 else None,
+        "top4_tokens": getattr(batch, "draft_top4", None),
     }
 
 
@@ -155,27 +186,38 @@ def finish_verify_round(batch, accepted_counts) -> None:
             )
             sets = {}
             for lid, idx in layers.items():
-                row = base + j
+                row = base + j + int(_TOP4)
                 if row < idx.shape[0]:
                     sets[str(lid)] = idx[row].tolist()
             req_slots.append(
-                {"slot": j, "token_id": tok, "accepted": j < n_acc, "sets": sets}
+                {"slot": j, "token_id": tok, "accepted": j < n_acc, "sets": sets,
+                 **({"position": int(geo["positions"][base + j + 1])} if _TOP4 else {})}
             )
-        slots.append({"req": geo["req_uids"][i], "n_acc": n_acc, "slots": req_slots})
+        request_record = {"req": geo["req_uids"][i], "n_acc": n_acc, "slots": req_slots}
+        if _TOP4:
+            request_record["anchor"] = {"position": int(geo["positions"][base]),
+                "token_id": int(geo["input_ids"][base]),
+                "sets": {str(lid): idx[base].tolist() for lid, idx in layers.items()}}
+            request_record["top4_tokens"] = geo["top4_tokens"][i].tolist()
+        slots.append(request_record)
 
     rec = {
         "round": rnd,
         "ts": time.time(),
         "k": k,
         "reqs": slots,
-        "prev": _STATE.get("prev_round"),
+        "prev": None if _TOP4 else _STATE.get("prev_round"),
     }
-    _metric2(rnd, rec)
+    if _TOP4:
+        rec["schema"] = 2
+    else:
+        _metric2(rnd, rec)
     out = Path(_DIR)
     out.mkdir(parents=True, exist_ok=True)
     with open(out / "rounds.jsonl", "a") as f:
         f.write(json.dumps(rec) + "\n")
-    _STATE["prev_round"] = rec
+    if not _TOP4:
+        _STATE["prev_round"] = rec
 
 
 def _overlap(a, b):

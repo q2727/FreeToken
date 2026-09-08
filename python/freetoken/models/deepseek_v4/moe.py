@@ -37,7 +37,7 @@ class Gate(nn.Module):
         else:
             self.bias = nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32), requires_grad=False)
 
-    def forward(self, x: torch.Tensor, input_ids: torch.Tensor, restrict: torch.Tensor | None = None):
+    def forward(self, x: torch.Tensor, input_ids: torch.Tensor, restrict: torch.Tensor | None = None, topk: int | None = None):
         scores = bf16_linear_fp32(x, self.weight)
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1)
@@ -57,7 +57,7 @@ class Gate(nn.Module):
                 # fall back to score-based selection here -- the tid2eid table
                 # cannot express a resident-set restriction.
                 scores = scores.masked_fill(~restrict, float("-inf"))
-            indices = scores.topk(self.topk, dim=-1)[1]
+            indices = scores.topk(self.topk if topk is None else topk, dim=-1)[1]
         weights = original_scores.gather(1, indices)
         if self.score_func != "softmax":
             weights = weights / weights.sum(dim=-1, keepdim=True)
@@ -192,6 +192,32 @@ class MoE(nn.Module):
         # shadow hidden states -- diverted into the shadow capture.
         from freetoken.metrics.expert_overlap import note_router, resident_mask, shadow_active
         note_router(self.experts.layer_id, indices)
+        from freetoken.metrics.expert_overlap import top4_enabled
+        if shadow_active() and top4_enabled():
+            # Measurement reads resident banks directly. Do not ensure/copy experts,
+            # submit CPU work, or update LRU: all four candidates see one cache state.
+            cache = self.experts.offload_cache
+            if cache is None:
+                raise RuntimeError("top4 cache-only measurement requires an offload cache")
+            slots = cache.slot_for_id[self.experts.layer_id]
+            mask = slots >= 0
+            count = min(self.experts.top_k, int(mask.sum().item()))
+            shared = self.shared_experts(x)
+            if count:
+                weights, ids = self.gate(x, input_ids, restrict=mask, topk=count)
+                slot_ids = slots[ids.long()].to(torch.int32).contiguous()
+                assert bool((slot_ids >= 0).all())
+                routed = self.experts._expert_gemm(
+                    cache, x, weights.float().contiguous(), slot_ids,
+                    views=cache.bank_views(), n=None,
+                    alphas=cache.alphas_for_slots(self.experts.layer_id), is_prefill=False,
+                )
+                out = shared + routed
+            else:
+                out = shared
+            if self._comm is not None:
+                out = self._comm.all_reduce(out)
+            return out.view(shape)
         if shadow_active():
             # Metric-1 cache-only rerun: recompute the routing restricted to the
             # layer's GPU-cache-resident experts for the actual MoE compute

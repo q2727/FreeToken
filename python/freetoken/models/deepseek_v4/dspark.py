@@ -664,13 +664,20 @@ class DSparkDrafter(nn.Module):
         confidence = torch.empty(
             (requests, gamma), dtype=torch.float32, device=base_logits.device
         )
-        top4 = torch.empty(
-            (requests, gamma, min(4, vocab)), dtype=torch.long, device=base_logits.device
-        )
+        from freetoken.metrics.expert_overlap import top4_enabled
+        capture = top4_enabled()
+        self.last_top4 = None
+        top4 = torch.empty((requests, gamma, 4), dtype=torch.long, device=base_logits.device) if capture else None
         for k in range(gamma):
             markov = self.markov_head.embed(prev)
             logits_k = base_logits[:, k].float() + self.markov_head.bias(markov).float()
-            top4[:, k].copy_(logits_k.topk(min(4, vocab), dim=-1).indices)
+            if capture:
+                # Greedy q is a point mass. Rank raw Markov-adjusted logits instead,
+                # with rank 0 exactly matching argmax even in the presence of ties.
+                first = logits_k.argmax(dim=-1, keepdim=True)
+                rest_scores = logits_k.clone().scatter_(-1, first, float("-inf"))
+                ids = torch.cat((first, rest_scores.topk(3, dim=-1).indices), dim=-1)
+                top4[:, k].copy_(ids)
             step_tokens = []
             for r, params in enumerate(sampling_params):
                 q_r = sampling_probs(
@@ -691,7 +698,7 @@ class DSparkDrafter(nn.Module):
                 self.confidence_head(head_hidden[:, k], markov)
             )
             prev = next_token
-        self.last_top4 = top4.detach().to("cpu", non_blocking=False)
+        self.last_top4 = top4.detach().cpu() if capture else None
         return proposed.flatten(), q.flatten(0, 1), confidence.flatten()
 
 

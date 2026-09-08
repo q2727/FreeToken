@@ -27,6 +27,7 @@ requests -- either would invalidate the slot maps the rerun's attention reads.
 from __future__ import annotations
 
 import torch
+import traceback
 
 from freetoken.core import get_global_ctx
 from freetoken.metrics import expert_overlap as eo
@@ -48,14 +49,18 @@ def maybe_run_shadow(engine, batch, target_cpu, proposed_cpu) -> None:
         k = int(batch.spec_block)
         if all(n_acc >= k for n_acc in accepted_counts):
             return  # nothing rejected this round
-        _run(engine, batch, accepted_counts)
-        if getattr(batch, "draft_top4", None) is not None:
+        if eo.top4_enabled():
             _run_top4(engine, batch, accepted_counts, batch.draft_top4)
+        else:
+            _run(engine, batch, accepted_counts)
     except Exception:
         # Measurement must never take down the serving path. Pool state is
         # restored in _run's finally, so a failure here leaves a lost shadow
         # record, not corruption.
         logger.warning("metric-1 shadow rerun failed; skipping this round", exc_info=True)
+        if eo.top4_enabled():
+            logger.error("top4 measurement failed: %s", traceback.format_exc())
+            raise  # A failed measurement must not silently enter the result set.
 
 
 def _greedy_accepted_counts(batch, target_cpu, proposed_cpu) -> list[int]:
@@ -96,6 +101,8 @@ def _run(engine, batch, accepted_counts) -> None:
 def _run_capture(engine, batch):
     snapshot = _snapshot_pools(engine, batch)
     saved_journal = batch.spec_carry_states
+    transformer = engine.model._transformer
+    saved_features = transformer._target_features
     batch.spec_carry_states = {}
     eo.begin_shadow()
     try:
@@ -103,22 +110,38 @@ def _run_capture(engine, batch):
             engine.model.forward()
         return eo.shadow_layer_capture()
     finally:
-        eo.end_shadow(); batch.spec_carry_states = saved_journal; _restore_pools(engine, batch, snapshot)
+        eo.end_shadow()
+        batch.spec_carry_states = saved_journal
+        transformer._target_features = saved_features
+        _restore_pools(engine, batch, snapshot)
 
 def _run_top4(engine, batch, accepted_counts, top4):
+    if top4 is None:
+        raise RuntimeError("missing top4 draft candidates")
     top4 = top4.reshape(-1, 4)
     original = batch.input_ids.clone()
     captures = []
     round_id = eo.current_round() + 1
     k = int(batch.spec_block); span = k + 1
-    for rank in range(4):
+    assert k == 8 and top4.shape == (k * len(batch.reqs), 4)
+    assert torch.equal(top4[:, 0], batch.draft_tokens.detach().cpu().reshape(-1))
+    caches = {id(layer.ffn.experts.offload_cache): layer.ffn.experts.offload_cache
+              for layer in engine.model._transformer.layers}
+    cache_before = [(c, {name: getattr(c, name).clone() for name in
+                         ("slot_for_id", "id_of_slot", "usage", "step", "expert_recency")})
+                    for c in caches.values()]
+    try:
+        for rank in range(4):
+            batch.input_ids.copy_(original)
+            for i, n_acc in enumerate(accepted_counts):
+                for j in range(n_acc, k):
+                    row = i * span + j + 1
+                    batch.input_ids.reshape(-1)[row] = int(top4[i * k + j, rank])
+            captures.append(_run_capture(engine, batch))
+        for cache, old in cache_before:
+            assert all(torch.equal(getattr(cache, name), val) for name, val in old.items()), "shadow changed cache state"
+    finally:
         batch.input_ids.copy_(original)
-        for i, n_acc in enumerate(accepted_counts):
-            for j in range(n_acc, k):
-                row = i * span + j + 1
-                batch.input_ids[row] = top4[i * k + j, rank]
-        captures.append(_run_capture(engine, batch))
-    batch.input_ids.copy_(original)
     eo.write_top4_record(round_id, accepted_counts, top4, captures)
 
 

@@ -1619,6 +1619,8 @@ class Engine:
             if profiling else nullcontext()
         )
         with profile_ctx as prof:
+            from freetoken.metrics.expert_overlap import begin_decode_observation, finish_decode_observation
+            begin_decode_observation(batch)
             if getattr(batch, "speculative", False):
                 from freetoken.metrics.expert_overlap import begin_verify_round
                 begin_verify_round(batch)
@@ -1633,6 +1635,7 @@ class Engine:
                     logits = self.model.forward()
                     get_features = getattr(self.model, "dspark_target_features", None)
                     target_features = get_features() if get_features is not None else None
+        finish_decode_observation(batch)
         if profiling:
             torch.cuda.synchronize(self.device)
             assert prof is not None
