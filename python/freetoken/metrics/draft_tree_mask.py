@@ -5,6 +5,7 @@ the attention mask lets a node attend to its ancestors and itself only.
 """
 from __future__ import annotations
 
+import heapq
 import torch
 
 
@@ -16,31 +17,27 @@ def build_tree(tokens: torch.Tensor, logprobs: torch.Tensor, budget: int):
     """
     if budget <= 0 or tokens.numel() == 0:
         z = torch.empty(0, dtype=torch.long, device=tokens.device)
-        return {"tokens": z, "parents": z, "depths": z, "scores": z.float()}
+        return {"tokens": z, "parents": z, "depths": z, "scores": z.float(), "cols": z}
     tokens, logprobs = tokens.detach(), logprobs.detach()
-    frontier = [(-1, -1, 0.0)]
+    heap = [(-float(logprobs[0, col]), -1, 0, col)
+            for col in range(tokens.shape[1])]
+    heapq.heapify(heap)
     out = []
-    for depth in range(tokens.shape[0]):
-        candidates = []
-        for parent, _old_depth, score in frontier:
-            for col in range(tokens.shape[1]):
-                candidates.append((score + float(logprobs[depth, col]), parent, depth, col))
-        candidates.sort(key=lambda x: (-x[0], x[1], x[3]))
-        keep = candidates[: max(0, budget - len(out))]
-        if not keep:
-            break
-        next_frontier = []
-        for score, parent, d, col in keep:
-            idx = len(out)
-            out.append((int(tokens[d, col]), parent, d, score))
-            next_frontier.append((idx, d, score))
-        frontier = next_frontier
+    while heap and len(out) < budget:
+        neg_score, parent, depth, col = heapq.heappop(heap)
+        score, idx = -neg_score, len(out)
+        out.append((int(tokens[depth, col]), parent, depth, score, col))
+        if depth + 1 < tokens.shape[0]:
+            for child in range(tokens.shape[1]):
+                heapq.heappush(heap, (-(score + float(logprobs[depth + 1, child])),
+                                      idx, depth + 1, child))
     if not out:
-        return {"tokens": torch.empty(0, dtype=torch.long), "parents": torch.empty(0, dtype=torch.long),
-                "depths": torch.empty(0, dtype=torch.long), "scores": torch.empty(0)}
+        z = torch.empty(0, dtype=torch.long, device=tokens.device)
+        return {"tokens": z, "parents": z, "depths": z, "scores": z.float(), "cols": z}
     return {k: torch.tensor([row[i] for row in out], device=tokens.device,
                             dtype=torch.float32 if k == "scores" else torch.long)
-            for k, i in (("tokens", 0), ("parents", 1), ("depths", 2), ("scores", 3))}
+            for k, i in (("tokens", 0), ("parents", 1), ("depths", 2),
+                         ("scores", 3), ("cols", 4))}
 
 
 def ancestor_mask(parents: torch.Tensor) -> torch.Tensor:

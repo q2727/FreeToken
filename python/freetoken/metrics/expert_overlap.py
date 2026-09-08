@@ -67,7 +67,14 @@ def write_tree_record(round_id: int, accepted_counts, tree_tokens, tree_sets) ->
     for i, n_acc in enumerate(accepted_counts):
         rejected = []
         for j in range(n_acc, k):
-            sets = {str(lid): sorted(values) for lid, values in tree_sets[i][j].items()}
+            sets = {}
+            for lid, occurrences in tree_sets[i][j].items():
+                top1 = {e for rank, values in occurrences if rank == 0 for e in values}
+                freq = {}
+                for _rank, values in occurrences:
+                    for e in values:
+                        freq[e] = freq.get(e, 0) + 1
+                sets[lid] = sorted(freq, key=lambda e: (-freq[e], e))[:len(top1)]
             rejected.append({"slot": j, "token_id": int(tree_tokens[i][j]), "sets": sets})
         reqs.append({"req": geo["req_uids"][i], "n_acc": int(n_acc), "rejected": rejected})
     out = Path(_DIR); out.mkdir(parents=True, exist_ok=True)

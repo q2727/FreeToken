@@ -166,6 +166,7 @@ def _run_tree(engine, batch, accepted_counts, top4):
     try:
         for i, n_acc in enumerate(accepted_counts):
             rows = [dict() for _ in range(k)]
+            seen_nodes = set()
             token_rows = [int(top4[i, j, 0]) for j in range(k)]
             for j in range(n_acc, k):
                 token_rows[j] = int(top4[i, j, 0])
@@ -185,8 +186,12 @@ def _run_tree(engine, batch, accepted_counts, top4):
                 for node in path:
                     depth = int(tree["depths"][node]) + n_acc
                     row = i * span + depth + 1
+                    if node in seen_nodes:
+                        continue
+                    seen_nodes.add(node)
+                    rank = int(tree["cols"][node])
                     for lid, idx in capture.items():
-                        rows[depth].setdefault(str(lid), set()).update(idx[row].tolist())
+                        rows[depth].setdefault(str(lid), []).append((rank, set(idx[row].tolist())))
             tokens.append(token_rows)
             unions.append(rows)
     finally:
