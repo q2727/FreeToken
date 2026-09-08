@@ -106,6 +106,7 @@ def _run_capture(engine, batch):
         eo.end_shadow(); batch.spec_carry_states = saved_journal; _restore_pools(engine, batch, snapshot)
 
 def _run_top4(engine, batch, accepted_counts, top4):
+    top4 = top4.reshape(-1, 4)
     original = batch.input_ids.clone()
     captures = []
     round_id = eo.current_round() + 1
