@@ -28,6 +28,7 @@ slot cache and the KV pools address draft and target layers with one index space
 from __future__ import annotations
 
 import math
+import os
 import statistics
 from collections import deque
 from typing import Sequence
@@ -395,6 +396,7 @@ class DSparkDrafter(nn.Module):
         self.block_size = args.dspark_block_size
         self.noise_token_id = args.dspark_noise_token_id
         self.last_top4: torch.Tensor | None = None
+        self.last_tree: list[dict] | None = None
         self.target_layer_ids = tuple(args.dspark_target_layer_ids)
         self.n_layers = n_draft = args.n_draft_layers
 
@@ -666,18 +668,26 @@ class DSparkDrafter(nn.Module):
         )
         from freetoken.metrics.expert_overlap import top4_enabled
         capture = top4_enabled()
+        tree_capture = os.environ.get("FT_DSPARK_DRAFT_TREE", "0") == "1"
         self.last_top4 = None
-        top4 = torch.empty((requests, gamma, 4), dtype=torch.long, device=base_logits.device) if capture else None
+        self.last_tree = None
+        top4 = torch.empty((requests, gamma, 4), dtype=torch.long, device=base_logits.device) if capture or tree_capture else None
+        top4_logprobs = torch.empty((requests, gamma, 4), dtype=torch.float32, device=base_logits.device) if tree_capture else None
         for k in range(gamma):
             markov = self.markov_head.embed(prev)
             logits_k = base_logits[:, k].float() + self.markov_head.bias(markov).float()
-            if capture:
+            if capture or tree_capture:
                 # Greedy q is a point mass. Rank raw Markov-adjusted logits instead,
                 # with rank 0 exactly matching argmax even in the presence of ties.
                 first = logits_k.argmax(dim=-1, keepdim=True)
                 rest_scores = logits_k.clone().scatter_(-1, first, float("-inf"))
                 ids = torch.cat((first, rest_scores.topk(3, dim=-1).indices), dim=-1)
-                top4[:, k].copy_(ids)
+                if top4 is not None:
+                    top4[:, k].copy_(ids)
+                if top4_logprobs is not None:
+                    top4_logprobs[:, k].copy_(
+                        logits_k.log_softmax(dim=-1).gather(-1, ids)
+                    )
             step_tokens = []
             for r, params in enumerate(sampling_params):
                 q_r = sampling_probs(
@@ -699,6 +709,18 @@ class DSparkDrafter(nn.Module):
             )
             prev = next_token
         self.last_top4 = top4.detach().cpu() if capture else None
+        if tree_capture:
+            from freetoken.metrics.draft_tree_mask import compile_tree
+            budget = max(1, int(os.environ.get("FT_DSPARK_TREE_BUDGET", "16")))
+            self.last_tree = [
+                compile_tree(
+                    torch.empty(0, dtype=torch.long),
+                    top4[r].detach().cpu(),
+                    top4_logprobs[r].detach().cpu(),
+                    budget,
+                )
+                for r in range(requests)
+            ]
         return proposed.flatten(), q.flatten(0, 1), confidence.flatten()
 
 

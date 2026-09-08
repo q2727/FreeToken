@@ -558,6 +558,15 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
         drafter.last_top4 = None
         return value
 
+    def pop_draft_tree(self) -> list[dict] | None:
+        """Take the packed top-k draft tree produced by the last draft pass."""
+        drafter = self._transformer.drafter
+        if drafter is None:
+            return None
+        value = drafter.last_tree
+        drafter.last_tree = None
+        return value
+
     def forward(self) -> torch.Tensor:
         self._ensure_bound()
         batch = get_global_ctx().batch

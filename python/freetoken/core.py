@@ -169,6 +169,10 @@ class Batch:
     # They stay on GPU through verification; only the accepted prefix is copied back.
     draft_tokens: torch.Tensor | None = field(default=None, init=False)
     draft_top4: torch.Tensor | None = field(default=None, init=False)
+    # Optional packed top-k tree from the drafter.  The target verify path consumes
+    # this only when a tree-aware attention backend is selected; linear DSpark keeps
+    # the field empty and preserves the existing fixed-span graph.
+    draft_tree: List[dict] | None = field(default=None, init=False)
     # Per-token compressor partial states produced by a speculative target verify.
     # FreeToken's compressor ring is page-addressed, so later tokens in the same page
     # overwrite earlier states.  This journal is the engine-native equivalent of

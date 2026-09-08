@@ -1592,6 +1592,7 @@ class Engine:
         batch.draft_tokens = proposed
         batch.draft_probs = q
         batch.draft_top4 = getattr(self.model, "pop_draft_top4", lambda: None)()
+        batch.draft_tree = getattr(self.model, "pop_draft_tree", lambda: None)()
         batch.spec_carry_states = {}
         return confidence
 
