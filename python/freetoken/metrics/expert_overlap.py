@@ -297,8 +297,8 @@ def summary(rows) -> str:
 def write_shadow_record(round_id: int, accepted_counts) -> int:
     """Write the metric-1 shadow-rerun record for the in-flight round.
 
-    Pairs, per rejected slot (``slot j >= n_acc``, same window-offset row convention
-    as finish_verify_round: row = base + j), the original round's full-space router
+    Pairs, per rejected slot (``slot j >= n_acc``), using the actual draft input row
+    ``base + j + 1`` (the anchor is row ``base``), the original round's full-space router
     set A (from the live _STATE capture, consumed later by finish_verify_round)
     against the shadow rerun's full-space set A' (_SHADOW["layers"], recorded while
     the MoE compute itself was restricted to cache-resident experts). Emits
@@ -318,7 +318,10 @@ def write_shadow_record(round_id: int, accepted_counts) -> int:
         slots = []
         for j in range(n_acc, k):
             n_rejected += 1
-            row = base + j
+            # Verify input is [anchor, draft_0, ..., draft_{k-1}].  The normal
+            # round record keeps legacy slot labels, but shadow rows must follow
+            # the actual draft token input position.
+            row = base + j + 1
             tok = (
                 int(geo["draft_tokens"][i * k + j])
                 if geo["draft_tokens"] is not None
