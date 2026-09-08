@@ -53,3 +53,30 @@ def ancestor_mask(parents: torch.Tensor) -> torch.Tensor:
             mask[node, cur] = True
             cur = int(parents[cur])
     return mask
+
+
+def compile_tree(prefix: torch.Tensor, tokens: torch.Tensor,
+                 logprobs: torch.Tensor, budget: int):
+    """Pack one request's prefix and tree nodes for a tree-attention forward.
+
+    The prefix is shared once.  Tree nodes are the only newly computed tokens;
+    rows after a node are never materialized.  ``mask`` is boolean attention
+    visibility for the packed rows.
+    """
+    tree = build_tree(tokens, logprobs, budget)
+    p = int(prefix.numel())
+    n = int(tree["tokens"].numel())
+    parents = tree["parents"] + p
+    full_parents = torch.cat([
+        torch.arange(p, device=prefix.device, dtype=torch.long) - 1,
+        parents,
+    ])
+    mask = ancestor_mask(full_parents)
+    if p:
+        mask[:p, :p] = torch.tril(torch.ones((p, p), dtype=torch.bool,
+                                              device=prefix.device))
+        mask[p:, :p] = True
+    return {"input_ids": torch.cat((prefix, tree["tokens"])),
+            "positions": torch.cat((torch.arange(p, device=prefix.device),
+                                     p + tree["depths"])),
+            "parents": full_parents, "mask": mask, **tree}
