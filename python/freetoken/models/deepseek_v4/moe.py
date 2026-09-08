@@ -195,7 +195,7 @@ class MoE(nn.Module):
         )
         note_router(self.experts.layer_id, indices)
         from freetoken.metrics.expert_overlap import top4_enabled
-        if shadow_active() and top4_enabled():
+        if shadow_active() and top4_enabled() and shadow_failed_rows() is None:
             # Measurement reads resident banks directly. Do not ensure/copy experts,
             # submit CPU work, or update LRU: all four candidates see one cache state.
             cache = self.experts.offload_cache

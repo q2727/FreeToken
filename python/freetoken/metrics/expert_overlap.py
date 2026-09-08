@@ -58,6 +58,24 @@ def write_top4_record(round_id: int, accepted_counts, top4_tokens, captures) -> 
                            "context": "rank_cohort", "reqs": reqs}) + "\n")
 
 
+def write_tree_record(round_id: int, accepted_counts, tree_tokens, tree_sets) -> None:
+    """Persist cache-only expert unions for the pruned top4 tree."""
+    if not _ACTIVE or _STATE["batch"] is None:
+        return
+    geo, k = _STATE["batch"], _STATE["batch"]["k"]
+    reqs = []
+    for i, n_acc in enumerate(accepted_counts):
+        rejected = []
+        for j in range(n_acc, k):
+            sets = {str(lid): sorted(values) for lid, values in tree_sets[i][j].items()}
+            rejected.append({"slot": j, "token_id": int(tree_tokens[i][j]), "sets": sets})
+        reqs.append({"req": geo["req_uids"][i], "n_acc": int(n_acc), "rejected": rejected})
+    out = Path(_DIR); out.mkdir(parents=True, exist_ok=True)
+    with open(out / "tree_shadow.jsonl", "a") as f:
+        f.write(json.dumps({"schema": 3, "round": round_id, "k": k,
+                            "context": "top4_tree_pruned", "reqs": reqs}) + "\n")
+
+
 def top4_enabled() -> bool:
     return _TOP4 and _ACTIVE
 

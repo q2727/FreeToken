@@ -26,6 +26,7 @@ requests -- either would invalidate the slot maps the rerun's attention reads.
 
 from __future__ import annotations
 
+import os
 import torch
 import traceback
 
@@ -50,7 +51,10 @@ def maybe_run_shadow(engine, batch, target_cpu, proposed_cpu) -> None:
         if all(n_acc >= k for n_acc in accepted_counts):
             return  # nothing rejected this round
         if eo.top4_enabled():
-            _run_top4(engine, batch, accepted_counts, batch.draft_top4)
+            if os.environ.get("FT_DSPARK_TREE_METRICS", "0") == "1":
+                _run_tree(engine, batch, accepted_counts, batch.draft_top4)
+            else:
+                _run_top4(engine, batch, accepted_counts, batch.draft_top4)
         else:
             _run(engine, batch, accepted_counts)
     except Exception:
@@ -101,13 +105,13 @@ def _run(engine, batch, accepted_counts) -> None:
     n_rejected = eo.write_shadow_record(round_id, accepted_counts)
     logger.info("metric-1 shadow rerun: round=%d rejected_slots=%d", round_id, n_rejected)
 
-def _run_capture(engine, batch):
+def _run_capture(engine, batch, failed_rows=None):
     snapshot = _snapshot_pools(engine, batch)
     saved_journal = batch.spec_carry_states
     transformer = engine.model._transformer
     saved_features = transformer._target_features
     batch.spec_carry_states = {}
-    eo.begin_shadow()
+    eo.begin_shadow(failed_rows)
     try:
         with engine.ctx.forward_batch(batch):
             engine.model.forward()
@@ -146,6 +150,48 @@ def _run_top4(engine, batch, accepted_counts, top4):
     finally:
         batch.input_ids.copy_(original)
     eo.write_top4_record(round_id, accepted_counts, top4, captures)
+
+
+def _run_tree(engine, batch, accepted_counts, top4):
+    """Verify pruned top4-tree leaf paths and union each depth's router sets."""
+    if top4 is None:
+        raise RuntimeError("missing top4 draft candidates")
+    from freetoken.metrics.draft_tree_mask import compile_tree, leaf_paths
+    top4 = top4.reshape(len(batch.reqs), int(batch.spec_block), 4)
+    original = batch.input_ids.clone()
+    k, span = int(batch.spec_block), int(batch.spec_block) + 1
+    round_id = eo.current_round() + 1
+    budget = max(1, int(os.environ.get("FT_DSPARK_TREE_BUDGET", "16")))
+    tokens, unions = [], []
+    try:
+        for i, n_acc in enumerate(accepted_counts):
+            rows = [dict() for _ in range(k)]
+            token_rows = [int(top4[i, j, 0]) for j in range(k)]
+            for j in range(n_acc, k):
+                token_rows[j] = int(top4[i, j, 0])
+            tree = compile_tree(
+                torch.empty(0, dtype=torch.long), top4[i, n_acc:].cpu(),
+                torch.arange(4, 0, -1, dtype=torch.float32).expand(k - n_acc, 4), budget,
+            )
+            for path in leaf_paths(tree["parents"]):
+                batch.input_ids.copy_(original)
+                failed_rows = []
+                for node in path:
+                    depth = int(tree["depths"][node]) + n_acc
+                    row = i * span + depth + 1
+                    batch.input_ids.reshape(-1)[row] = int(tree["tokens"][node])
+                    failed_rows.append(row)
+                capture = _run_capture(engine, batch, failed_rows)
+                for node in path:
+                    depth = int(tree["depths"][node]) + n_acc
+                    row = i * span + depth + 1
+                    for lid, idx in capture.items():
+                        rows[depth].setdefault(str(lid), set()).update(idx[row].tolist())
+            tokens.append(token_rows)
+            unions.append(rows)
+    finally:
+        batch.input_ids.copy_(original)
+    eo.write_tree_record(round_id, accepted_counts, tokens, unions)
 
 
 # ---------------------------------------------------------------------------

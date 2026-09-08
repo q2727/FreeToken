@@ -55,6 +55,24 @@ def ancestor_mask(parents: torch.Tensor) -> torch.Tensor:
     return mask
 
 
+def leaf_paths(parents: torch.Tensor) -> list[list[int]]:
+    """Return root-to-leaf node paths, so each path can be verified linearly."""
+    n = int(parents.numel())
+    children = [[] for _ in range(n)]
+    for node, parent in enumerate(parents.tolist()):
+        if parent >= 0:
+            children[parent].append(node)
+    leaves = [i for i, c in enumerate(children) if not c]
+    paths = []
+    for leaf in leaves:
+        path = []
+        while leaf >= 0:
+            path.append(leaf)
+            leaf = int(parents[leaf])
+        paths.append(path[::-1])
+    return paths
+
+
 def compile_tree(prefix: torch.Tensor, tokens: torch.Tensor,
                  logprobs: torch.Tensor, budget: int):
     """Pack one request's prefix and tree nodes for a tree-attention forward.
