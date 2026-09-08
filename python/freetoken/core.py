@@ -168,6 +168,7 @@ class Batch:
     # Tokens produced by the paper's sequential Markov stage, [requests * gamma].
     # They stay on GPU through verification; only the accepted prefix is copied back.
     draft_tokens: torch.Tensor | None = field(default=None, init=False)
+    draft_top4: torch.Tensor | None = field(default=None, init=False)
     # Per-token compressor partial states produced by a speculative target verify.
     # FreeToken's compressor ring is page-addressed, so later tokens in the same page
     # overwrite earlier states.  This journal is the engine-native equivalent of

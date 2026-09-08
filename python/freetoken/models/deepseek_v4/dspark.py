@@ -394,6 +394,7 @@ class DSparkDrafter(nn.Module):
         self.norm_eps = args.norm_eps
         self.block_size = args.dspark_block_size
         self.noise_token_id = args.dspark_noise_token_id
+        self.last_top4: torch.Tensor | None = None
         self.target_layer_ids = tuple(args.dspark_target_layer_ids)
         self.n_layers = n_draft = args.n_draft_layers
 
@@ -663,9 +664,13 @@ class DSparkDrafter(nn.Module):
         confidence = torch.empty(
             (requests, gamma), dtype=torch.float32, device=base_logits.device
         )
+        top4 = torch.empty(
+            (requests, gamma, min(4, vocab)), dtype=torch.long, device=base_logits.device
+        )
         for k in range(gamma):
             markov = self.markov_head.embed(prev)
             logits_k = base_logits[:, k].float() + self.markov_head.bias(markov).float()
+            top4[:, k].copy_(logits_k.topk(min(4, vocab), dim=-1).indices)
             step_tokens = []
             for r, params in enumerate(sampling_params):
                 q_r = sampling_probs(
@@ -686,6 +691,7 @@ class DSparkDrafter(nn.Module):
                 self.confidence_head(head_hidden[:, k], markov)
             )
             prev = next_token
+        self.last_top4 = top4.detach().to("cpu", non_blocking=False)
         return proposed.flatten(), q.flatten(0, 1), confidence.flatten()
 
 

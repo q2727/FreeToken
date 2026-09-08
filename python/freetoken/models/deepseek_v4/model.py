@@ -550,6 +550,14 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
             sampling_params,
         )
 
+    def pop_draft_top4(self) -> torch.Tensor | None:
+        drafter = self._transformer.drafter
+        if drafter is None:
+            return None
+        value = drafter.last_top4
+        drafter.last_top4 = None
+        return value
+
     def forward(self) -> torch.Tensor:
         self._ensure_bound()
         batch = get_global_ctx().batch
