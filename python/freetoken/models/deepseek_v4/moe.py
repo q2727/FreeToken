@@ -235,13 +235,19 @@ class MoE(nn.Module):
                     x[normal_mask], weights[normal_mask].float().contiguous(),
                     indices[normal_mask].to(torch.int32).contiguous())
             if bool(failed.numel()):
-                mask = resident_mask(self.experts.offload_cache, self.experts.layer_id,
-                                     self.experts.num_experts, self.experts.top_k)
-                if mask is None:
-                    raise RuntimeError("cache-only shadow lacks resident experts")
-                fw, fi = self.gate(x[failed], input_ids[failed], restrict=mask)
-                routed[failed] = self.experts.routed_forward(
-                    x[failed], fw.float().contiguous(), fi.to(torch.int32).contiguous())
+                # Early rounds can have fewer resident experts than model top-k.
+                # Restrict to the currently resident subset; an empty cache has
+                # zero routed contribution until the normal prefix warms it.
+                cache = self.experts.offload_cache
+                mask = resident_mask(cache, self.experts.layer_id,
+                                     self.experts.num_experts, 1)
+                if mask is not None:
+                    count = min(self.experts.top_k, int(mask.sum().item()))
+                    fw, fi = self.gate(x[failed], input_ids[failed],
+                                        restrict=mask, topk=count)
+                    routed[failed] = self.experts.routed_forward(
+                        x[failed], fw.float().contiguous(),
+                        fi.to(torch.int32).contiguous())
             out = routed + shared
             if self._comm is not None:
                 out = self._comm.all_reduce(out)
