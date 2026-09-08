@@ -30,6 +30,28 @@ _STATE: dict = {"round": -1, "layers": {}, "batch": None}
 # capture in _STATE stays untouched for finish_verify_round.
 _SHADOW: dict = {"active": False, "layers": {}}
 
+def shadow_layer_capture():
+    return {lid: idx.clone() for lid, idx in _SHADOW["layers"].items()}
+
+def write_top4_record(round_id: int, accepted_counts, top4_tokens, captures) -> None:
+    if not _ACTIVE or _STATE["batch"] is None:
+        return
+    geo, real, k = _STATE["batch"], _STATE["layers"], _STATE["batch"]["k"]
+    reqs = []
+    for i, n_acc in enumerate(accepted_counts):
+        items = []
+        for j in range(n_acc, k):
+            row = i * geo["span"] + j
+            candidates = []
+            for rank, layers in enumerate(captures):
+                sets = {str(lid): idx[row].tolist() for lid, idx in layers.items() if row < idx.shape[0]}
+                candidates.append({"rank": rank, "token_id": int(top4_tokens[i * k + j, rank]), "sets": sets})
+            items.append({"slot": j, "candidates": candidates})
+        reqs.append({"req": geo["req_uids"][i], "n_acc": int(n_acc), "rejected": items})
+    out = Path(_DIR); out.mkdir(parents=True, exist_ok=True)
+    with open(out / "top4_shadow.jsonl", "a") as f:
+        f.write(json.dumps({"round": round_id, "k": k, "reqs": reqs}) + "\n")
+
 
 def active() -> bool:
     return _ACTIVE

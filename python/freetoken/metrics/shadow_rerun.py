@@ -49,6 +49,8 @@ def maybe_run_shadow(engine, batch, target_cpu, proposed_cpu) -> None:
         if all(n_acc >= k for n_acc in accepted_counts):
             return  # nothing rejected this round
         _run(engine, batch, accepted_counts)
+        if getattr(batch, "draft_top4", None) is not None:
+            _run_top4(engine, batch, accepted_counts, batch.draft_top4)
     except Exception:
         # Measurement must never take down the serving path. Pool state is
         # restored in _run's finally, so a failure here leaves a lost shadow
@@ -90,6 +92,33 @@ def _run(engine, batch, accepted_counts) -> None:
         _restore_pools(engine, batch, snapshot)
     n_rejected = eo.write_shadow_record(round_id, accepted_counts)
     logger.info("metric-1 shadow rerun: round=%d rejected_slots=%d", round_id, n_rejected)
+
+def _run_capture(engine, batch):
+    snapshot = _snapshot_pools(engine, batch)
+    saved_journal = batch.spec_carry_states
+    batch.spec_carry_states = {}
+    eo.begin_shadow()
+    try:
+        with engine.ctx.forward_batch(batch):
+            engine.model.forward()
+        return eo.shadow_layer_capture()
+    finally:
+        eo.end_shadow(); batch.spec_carry_states = saved_journal; _restore_pools(engine, batch, snapshot)
+
+def _run_top4(engine, batch, accepted_counts, top4):
+    original = batch.input_ids.clone()
+    captures = []
+    round_id = eo.current_round() + 1
+    k = int(batch.spec_block); span = k + 1
+    for rank in range(4):
+        batch.input_ids.copy_(original)
+        for i, n_acc in enumerate(accepted_counts):
+            for j in range(n_acc, k):
+                row = i * span + j + 1
+                batch.input_ids[row] = top4[i * k + j, rank]
+        captures.append(_run_capture(engine, batch))
+    batch.input_ids.copy_(original)
+    eo.write_top4_record(round_id, accepted_counts, top4, captures)
 
 
 # ---------------------------------------------------------------------------
