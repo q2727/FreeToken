@@ -87,7 +87,10 @@ def _run(engine, batch, accepted_counts) -> None:
     saved_journal = batch.spec_carry_states
     batch.spec_carry_states = {}
     round_id = eo.current_round() + 1  # finish_verify_round assigns this id next
-    eo.begin_shadow()
+    failed_rows = [i * (int(batch.spec_block) + 1) + j + 1
+                   for i, n in enumerate(accepted_counts)
+                   for j in range(n, int(batch.spec_block))]
+    eo.begin_shadow(failed_rows)
     try:
         with engine.ctx.forward_batch(batch):
             engine.model.forward()  # logits discarded; only router sets are kept

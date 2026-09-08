@@ -29,7 +29,7 @@ _STATE: dict = {"round": -1, "layers": {}, "batch": None}
 # Metric-1 shadow rerun: while _SHADOW["active"] is set, note_router diverts into
 # _SHADOW["layers"] (the rerun's full-space router sets A') and the original round
 # capture in _STATE stays untouched for finish_verify_round.
-_SHADOW: dict = {"active": False, "layers": {}}
+_SHADOW: dict = {"active": False, "layers": {}, "failed_rows": None}
 
 def shadow_layer_capture():
     return {lid: idx.clone() for lid, idx in _SHADOW["layers"].items()}
@@ -108,13 +108,20 @@ def shadow_active() -> bool:
     return _ACTIVE and _SHADOW["active"]
 
 
-def begin_shadow() -> None:
+def begin_shadow(failed_rows=None) -> None:
     _SHADOW["active"] = True
     _SHADOW["layers"] = {}
+    _SHADOW["failed_rows"] = None if failed_rows is None else tuple(failed_rows)
 
 
 def end_shadow() -> None:
     _SHADOW["active"] = False
+    _SHADOW["failed_rows"] = None
+
+
+def shadow_failed_rows():
+    """Flat input rows whose routed output is the failed-token shadow."""
+    return _SHADOW.get("failed_rows") if _SHADOW.get("active") else None
 
 
 def current_round() -> int:

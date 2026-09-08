@@ -190,7 +190,9 @@ class MoE(nn.Module):
         # full-space top-k per MoE layer for the active verify round. During a
         # metric-1 shadow rerun this is A' -- the unrestricted choice under the
         # shadow hidden states -- diverted into the shadow capture.
-        from freetoken.metrics.expert_overlap import note_router, resident_mask, shadow_active
+        from freetoken.metrics.expert_overlap import (
+            note_router, resident_mask, shadow_active, shadow_failed_rows,
+        )
         note_router(self.experts.layer_id, indices)
         from freetoken.metrics.expert_overlap import top4_enabled
         if shadow_active() and top4_enabled():
@@ -215,6 +217,32 @@ class MoE(nn.Module):
                 out = shared + routed
             else:
                 out = shared
+            if self._comm is not None:
+                out = self._comm.all_reduce(out)
+            return out.view(shape)
+        failed_rows = shadow_failed_rows()
+        if shadow_active() and failed_rows is not None:
+            # Keep the accepted prefix as ordinary full-MoE context, while only
+            # the rejected tail uses the cache-only route.
+            failed = torch.tensor(failed_rows, dtype=torch.long, device=x.device)
+            failed = failed[failed < x.shape[0]]
+            normal_mask = torch.ones(x.shape[0], dtype=torch.bool, device=x.device)
+            normal_mask[failed] = False
+            shared = self.shared_experts(x)
+            routed = torch.zeros_like(x)
+            if bool(normal_mask.any()):
+                routed[normal_mask] = self.experts.routed_forward(
+                    x[normal_mask], weights[normal_mask].float().contiguous(),
+                    indices[normal_mask].to(torch.int32).contiguous())
+            if bool(failed.numel()):
+                mask = resident_mask(self.experts.offload_cache, self.experts.layer_id,
+                                     self.experts.num_experts, self.experts.top_k)
+                if mask is None:
+                    raise RuntimeError("cache-only shadow lacks resident experts")
+                fw, fi = self.gate(x[failed], input_ids[failed], restrict=mask)
+                routed[failed] = self.experts.routed_forward(
+                    x[failed], fw.float().contiguous(), fi.to(torch.int32).contiguous())
+            out = routed + shared
             if self._comm is not None:
                 out = self._comm.all_reduce(out)
             return out.view(shape)
